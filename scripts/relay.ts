@@ -79,6 +79,7 @@ function broadcast(data: string) {
 // ─── Event buffering ────────────────────────────────────────────────────────
 
 const eventBuffer = new Map<string, AgentEvent[]>()
+const agentSpawns = new Map<string, Map<string, AgentEvent>>()
 
 function broadcastEvent(event: AgentEvent) {
   sessionEventCount++
@@ -90,6 +91,11 @@ function broadcastEvent(event: AgentEvent) {
   log(`[event] ${event.type} (session ${sid})`)
 
   if (event.sessionId) {
+    if (event.type === 'agent_spawn' && typeof event.payload.name === 'string') {
+      const spawns = agentSpawns.get(event.sessionId) ?? new Map<string, AgentEvent>()
+      if (!spawns.has(event.payload.name)) spawns.set(event.payload.name, event)
+      agentSpawns.set(event.sessionId, spawns)
+    }
     let buf = eventBuffer.get(event.sessionId) || []
     buf.push(event)
     if (buf.length > MAX_EVENT_BUFFER) {
@@ -374,6 +380,8 @@ export interface RelayOptions {
    *  Mirrors the extension's `agentVisualizer.runtime` setting so users of the
    *  dev relay and `npx agent-flow-app` have a way to opt out of one runtime. */
   runtime?: RelayRuntimeMode
+  /** Watch Codex sessions across workspaces in the standalone app. */
+  allCodexWorkspaces?: boolean
 }
 
 function resolveRuntimeMode(explicit?: RelayRuntimeMode): RelayRuntimeMode {
@@ -431,14 +439,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   }
 
   // ─── Codex runtime ────────────────────────────────────────────────────────
-  // Watch Codex rollouts in parallel. No-op if ~/.codex/sessions doesn't
-  // exist or no sessions match the current workspace.
+  // Watch Codex rollouts in parallel with Claude Code.
   // We don't subscribe to onSessionDetected — it fires together with the
   // lifecycle 'started' event in CodexSessionWatcher.attachSession, so
   // wiring both would double-broadcast session-started to SSE clients.
   let codexWatcher: CodexSessionWatcher | null = null
   if (wantCodex) {
-    codexWatcher = new CodexSessionWatcher(workspace)
+    codexWatcher = new CodexSessionWatcher(options.allCodexWorkspaces ? null : workspace)
     codexWatcher.onEvent((event) => broadcastEvent(event))
     codexWatcher.onSessionLifecycle((lifecycle) => {
       broadcastSessionLifecycle(lifecycle.type, lifecycle.sessionId, lifecycle.label)
@@ -507,18 +514,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         sendSSE(res, { type: 'session-list', sessions: sessionList })
       }
 
-      // Replay buffered events for the most recent active session
-      const sorted = [...sessionList].sort((a, b) => {
-        const aActive = a.status === 'active' ? 1 : 0
-        const bActive = b.status === 'active' ? 1 : 0
-        if (aActive !== bActive) return bActive - aActive
-        return b.lastActivityTime - a.lastActivityTime
-      })
-      if (sorted.length > 0) {
-        const buffered = eventBuffer.get(sorted[0].id)
-        if (buffered) {
-          sendSSE(res, { type: 'agent-event-batch', events: buffered })
-        }
+      // Switching tabs uses the events buffered locally by the webview.
+      // Keep the initial spawn records even when the rolling buffer fills up.
+      for (const session of sessionList) {
+        const buffered = eventBuffer.get(session.id)
+        if (!buffered?.length) continue
+        const spawns = agentSpawns.get(session.id)
+        const retained = new Set(buffered)
+        const missingSpawns = spawns ? Array.from(spawns.values()).filter(e => !retained.has(e)) : []
+        sendSSE(res, { type: 'agent-event-batch', events: [...missingSpawns, ...buffered] })
       }
     },
 

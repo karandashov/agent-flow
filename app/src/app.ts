@@ -17,8 +17,8 @@ const args = parseArgs(process.argv.slice(2))
 
 console.log('Agent Flow\n')
 
-// Ensure hooks are configured
-ensureSetup()
+// Codex reads rollout files. Only Claude Code uses hooks.
+if (process.env.AGENT_FLOW_RUNTIME !== 'codex') ensureSetup()
 
 // Start the server
 startServer({

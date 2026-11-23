@@ -34,7 +34,9 @@ Claude Code is powerful, but its execution is a black box — you see the final 
 npx agent-flow-app
 ```
 
-This starts the visualizer in your browser. Start a Claude Code session in another terminal — events will stream in real-time.
+This starts the visualizer in your browser. Leave it running and send a message in a new Codex or Claude Code session. The standalone app discovers active Codex sessions across workspaces, including sessions from Codex Desktop. Codex subagents with their own rollout files appear in the parent chat's graph.
+
+For Codex only, run `AGENT_FLOW_RUNTIME=codex npx agent-flow-app`. Codex runs without configuring Claude Code hooks.
 
 Options:
 - `--port <number>` — change the server port (default: 3001)

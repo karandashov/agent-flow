@@ -2,10 +2,10 @@
  * Watches Codex rollout JSONL files at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
  *
  * Codex writes one JSONL file per session. Each file begins with a session_meta
- * record carrying the cwd, from which we match against the active VS Code
- * workspace. Discovery scans the past few days of session directories (to catch
- * sessions started near midnight), filters by cwd match and recency, and tails
- * matching files.
+ * record carrying the cwd and, for child agents, the parent thread ID.
+ * Recent root sessions are discovered across workspaces in standalone mode
+ * and scoped to the active workspace in VS Code. Child rollouts follow their
+ * root session even when they run in a different directory.
  *
  * No SQLite dependency — the canonical source is the filesystem. Respects
  * CODEX_HOME for non-default installs.
@@ -17,7 +17,7 @@ import * as os from 'os'
 import { AgentEvent, SessionInfo } from './protocol'
 import {
   ACTIVE_SESSION_AGE_S, INACTIVITY_TIMEOUT_MS, ORCHESTRATOR_NAME,
-  POLL_FALLBACK_MS, SCAN_INTERVAL_MS, SESSION_ID_DISPLAY,
+  SCAN_INTERVAL_MS, SESSION_ID_DISPLAY,
 } from './constants'
 import { readNewFileLines } from './fs-utils'
 import { createLogger } from './logger'
@@ -37,11 +37,18 @@ const SCAN_DAYS = 3
  *  Filenames look like: rollout-2026-04-22T09-15-00-{uuid}.jsonl */
 const SESSION_ID_FROM_FILENAME = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{36})\.jsonl$/
 
+interface CodexSessionMetadata {
+  cwd?: string
+  parentId?: string
+  nickname?: string
+  isInternal: boolean
+}
+
 interface WatchedCodexSession {
   sessionId: string
+  rootId: string
+  agentName: string
   filePath: string
-  fileWatcher: fs.FSWatcher | null
-  pollTimer: NodeJS.Timeout | null
   inactivityTimer: NodeJS.Timeout | null
   fileSize: number
   /** Leftover bytes past the last newline from the previous read — prepended
@@ -87,7 +94,7 @@ function recentSessionDirs(now: Date): string[] {
   return Array.from(seen)
 }
 
-/** Read the first line of a rollout file to extract cwd from session_meta.
+/** Read the first line of a rollout file to extract discovery metadata.
  *
  *  UTF-8 safety: `\n` is 0x0a, which never appears as a continuation byte in
  *  a multi-byte UTF-8 sequence (continuation bytes are 0x80–0xBF), so slicing
@@ -98,7 +105,7 @@ function recentSessionDirs(now: Date): string[] {
  *  it far larger — keep reading in chunks until the first newline, up to a
  *  1MB cap. Past the cap we give up: JSON.parse fails on the truncated object
  *  and we return null rather than emit a corrupted cwd. */
-function readSessionCwd(filePath: string): string | null {
+function readSessionMetadata(filePath: string): CodexSessionMetadata | null {
   const CHUNK_SIZE = 65536
   const MAX_FIRST_LINE = 1048576
   try {
@@ -119,11 +126,33 @@ function readSessionCwd(filePath: string): string | null {
         total += read
         if (newlineAt >= 0) { end = total - read + newlineAt; break }
       }
-      const data = Buffer.concat(chunks)
-      const line = data.subarray(0, end >= 0 ? end : data.length).toString('utf-8')
-      const parsed = JSON.parse(line) as { type?: string; payload?: { cwd?: string } }
-      if (parsed.type !== 'session_meta') return null
-      return typeof parsed.payload?.cwd === 'string' ? parsed.payload.cwd : null
+      if (end < 0) return null
+      const line = Buffer.concat(chunks).subarray(0, end).toString('utf-8')
+      const parsed = JSON.parse(line) as {
+        type?: string
+        payload?: {
+          cwd?: string
+          thread_source?: string
+          parent_thread_id?: string
+          source?: string | {
+            subagent?: {
+              thread_spawn?: { parent_thread_id?: string; agent_path?: string; agent_nickname?: string }
+            }
+          }
+        }
+      }
+      const payload = parsed.payload
+      if (parsed.type !== 'session_meta' || !payload) return null
+      const subagent = typeof payload.source === 'object' ? payload.source?.subagent : undefined
+      const spawn = subagent?.thread_spawn
+      const isSubagent = Boolean(subagent) || payload.thread_source === 'subagent'
+      const parentId = isSubagent ? spawn?.parent_thread_id || payload.parent_thread_id : undefined
+      return {
+        cwd: payload.cwd,
+        parentId,
+        nickname: spawn?.agent_nickname || spawn?.agent_path,
+        isInternal: payload.thread_source === 'guardian_review' || (isSubagent && !parentId),
+      }
     } finally { fs.closeSync(fd) }
   } catch { return null }
 }
@@ -131,8 +160,8 @@ function readSessionCwd(filePath: string): string | null {
 // ─── Watcher ───────────────────────────────────────────────────────────────
 
 export class CodexSessionWatcher implements AgentSessionWatcher {
-  private dirWatchers = new Map<string, fs.FSWatcher>()
   private sessions = new Map<string, WatchedCodexSession>()
+  private metadataByPath = new Map<string, CodexSessionMetadata>()
   private workspacePath: string | null = null
   private scanInterval: NodeJS.Timeout | null = null
   /** One-shot flag so the cwd-mismatch hint is logged at most once per process. */
@@ -153,18 +182,18 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
 
   isActive(): boolean {
     for (const s of this.sessions.values()) {
-      if (s.sessionDetected && !s.sessionCompleted) return true
+      if (s.rootId === s.sessionId && s.sessionDetected && !s.sessionCompleted) return true
     }
     return false
   }
 
   isSessionActive(sessionId: string): boolean {
     const s = this.sessions.get(sessionId)
-    return !!s && s.sessionDetected && !s.sessionCompleted
+    return !!s && s.rootId === sessionId && s.sessionDetected && !s.sessionCompleted
   }
 
   getActiveSessions(): SessionInfo[] {
-    return Array.from(this.sessions.values()).map(s => ({
+    return Array.from(this.sessions.values()).filter(s => s.rootId === s.sessionId).map(s => ({
       id: s.sessionId,
       label: s.label,
       status: s.sessionCompleted ? 'completed' : 'active',
@@ -175,7 +204,7 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
 
   replaySessionStart(sessionIds?: string[]): void {
     for (const [id, session] of this.sessions) {
-      if (!session.sessionDetected) continue
+      if (!session.sessionDetected || session.rootId !== id) continue
       if (sessionIds && !sessionIds.includes(id)) continue
       this._onSessionLifecycle.fire({ type: 'started', sessionId: id, label: session.label })
     }
@@ -188,33 +217,30 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     }
 
     this.scanForSessions()
-    this.scanInterval = setInterval(() => this.scanForSessions(), SCAN_INTERVAL_MS)
+    // A shared poller avoids opening one OS watch per child or chat.
+    this.scanInterval = setInterval(() => {
+      for (const sessionId of this.sessions.keys()) this.readNewLines(sessionId)
+      this.scanForSessions()
+    }, SCAN_INTERVAL_MS)
 
-    // Watch the sessions root for new day directories appearing.
-    const root = sessionsRoot()
-    if (fs.existsSync(root)) {
-      try {
-        const rootWatcher = fs.watch(root, { recursive: false }, () => this.scanForSessions())
-        this.dirWatchers.set(root, rootWatcher)
-      } catch (err) { log.debug('Root dir watch failed:', err) }
-    }
-
-    log.info(`Watching ${root} for workspace ${this.workspacePath ?? '<any>'}`)
+    log.info(`Watching ${sessionsRoot()} for workspace ${this.workspacePath ?? '<any>'}`)
   }
 
   private scanForSessions(): void {
     const now = new Date()
     let skippedByCwd = 0
-    for (const dir of recentSessionDirs(now)) {
+    const children = new Map<string, {
+      filePath: string
+      stat: fs.Stats
+      metadata: CodexSessionMetadata
+      parentId: string
+    }>()
+    const dirs = new Set(recentSessionDirs(now))
+    for (const filePath of this.metadataByPath.keys()) {
+      if (!dirs.has(path.dirname(filePath))) this.metadataByPath.delete(filePath)
+    }
+    for (const dir of dirs) {
       if (!fs.existsSync(dir)) continue
-
-      // Watch this day's directory so we pick up new rollout files quickly
-      if (!this.dirWatchers.has(dir)) {
-        try {
-          const w = fs.watch(dir, () => this.scanForSessions())
-          this.dirWatchers.set(dir, w)
-        } catch (err) { log.debug('Dir watch failed:', dir, err) }
-      }
 
       let entries: string[]
       try { entries = fs.readdirSync(dir) }
@@ -223,29 +249,54 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
       for (const name of entries) {
         if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue
         const filePath = path.join(dir, name)
-        if (this.sessions.has(this.sessionIdFor(filePath))) continue
+        const sessionId = this.sessionIdFor(filePath)
+        if (this.sessions.has(sessionId)) continue
 
-        // Recency filter — skip stale files
         let stat: fs.Stats
         try { stat = fs.statSync(filePath) } catch { continue }
-        if (stat.size === 0) continue
-        const ageS = (Date.now() - stat.mtimeMs) / 1000
-        if (ageS > ACTIVE_SESSION_AGE_S) continue
+        if (!stat.isFile() || stat.size === 0) continue
 
-        // Workspace filter — only attach if cwd matches (or no workspace set)
+        let metadata = this.metadataByPath.get(filePath)
+        if (!metadata) {
+          const read = readSessionMetadata(filePath)
+          if (!read) continue
+          metadata = read
+          this.metadataByPath.set(filePath, metadata)
+        }
+        if (metadata.isInternal) continue
+        if (metadata.parentId) {
+          children.set(sessionId, { filePath, stat, metadata, parentId: metadata.parentId })
+          continue
+        }
+
+        // Discover only recent root sessions; a known root can receive the
+        // earlier child rollouts from the same discovery window as well.
+        if ((now.getTime() - stat.mtimeMs) / 1000 > ACTIVE_SESSION_AGE_S) continue
         if (this.workspacePath) {
-          const cwd = readSessionCwd(filePath)
-          if (cwd === null) continue
-          const resolvedCwd = this.resolvePath(cwd)
-          if (!resolvedCwd || !this.pathMatchesWorkspace(resolvedCwd)) {
+          if (!metadata.cwd) continue
+          if (!this.pathMatchesWorkspace(this.resolvePath(metadata.cwd))) {
             skippedByCwd++
             continue
           }
         }
 
-        this.attachSession(filePath, stat)
+        this.attachSession(filePath, stat, metadata)
       }
     }
+
+    // A child can sort before its parent on disk. Revisit waiting children
+    // only while another attachment made progress; orphans stay out of tabs.
+    let attached: boolean
+    do {
+      attached = false
+      for (const [id, child] of children) {
+        const parent = this.sessions.get(child.parentId)
+        if (!parent) continue
+        this.attachSession(child.filePath, child.stat, child.metadata, parent)
+        children.delete(id)
+        attached = true
+      }
+    } while (attached && children.size > 0)
 
     // Recent Codex activity exists but none of it belongs to this workspace —
     // the #1 reason users see no Codex events. Say so once, loudly enough to
@@ -265,7 +316,7 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     return m ? m[1] : path.basename(filePath, '.jsonl')
   }
 
-  private resolvePath(p: string): string | null {
+  private resolvePath(p: string): string {
     try { return fs.realpathSync(p) } catch { return p }
   }
 
@@ -280,31 +331,38 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     return candidate.startsWith(workspace + path.sep)
   }
 
-  private attachSession(filePath: string, stat: fs.Stats): void {
+  private attachSession(
+    filePath: string,
+    stat: fs.Stats,
+    metadata: CodexSessionMetadata,
+    parent?: WatchedCodexSession,
+  ): void {
     const sessionId = this.sessionIdFor(filePath)
+    const rootId = parent?.rootId ?? sessionId
+    const agentName = parent ? `${metadata.nickname || 'Codex agent'} · ${sessionId.slice(-8)}` : ORCHESTRATOR_NAME
     const label = `Codex ${sessionId.slice(0, SESSION_ID_DISPLAY)}`
 
-    // Build the parser once per session so the delegate closures capture the
-    // right session reference and re-emission is stateless on this side.
     const parser = new CodexRolloutParser({
-      emit: (event) => this._onEvent.fire({ ...event, sessionId }),
+      emit: (event) => this._onEvent.fire({ ...event, sessionId: rootId }),
       elapsed: () => {
-        const s = this.sessions.get(sessionId)
-        return s ? (Date.now() - s.sessionStartTime) / 1000 : 0
+        const root = this.sessions.get(rootId)
+        return root ? (Date.now() - root.sessionStartTime) / 1000 : 0
       },
       setLabel: (newLabel) => {
         const s = this.sessions.get(sessionId)
-        if (!s || !s.label.startsWith('Codex ')) return // only replace auto-label
+        if (parent || !s || !s.label.startsWith('Codex ')) return
         s.label = newLabel
-        this._onSessionLifecycle.fire({ type: 'updated', sessionId, label: newLabel })
+        if (s.sessionDetected) {
+          this._onSessionLifecycle.fire({ type: 'updated', sessionId, label: newLabel })
+        }
       },
-    })
+    }, agentName, parent?.agentName)
 
     const session: WatchedCodexSession = {
       sessionId,
+      rootId,
+      agentName,
       filePath,
-      fileWatcher: null,
-      pollTimer: null,
       inactivityTimer: null,
       fileSize: 0,
       fileTail: '',
@@ -322,17 +380,11 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     this.readNewLines(sessionId)
 
     session.sessionDetected = true
-    this._onSessionDetected.fire(sessionId)
-    this._onSessionLifecycle.fire({ type: 'started', sessionId, label })
+    if (!parent) {
+      this._onSessionDetected.fire(sessionId)
+      this._onSessionLifecycle.fire({ type: 'started', sessionId, label: session.label })
+    }
 
-    try {
-      session.fileWatcher = fs.watch(filePath, () => this.readNewLines(sessionId))
-    } catch (err) { log.debug('File watch failed:', filePath, err) }
-
-    // fs.watch on macOS sometimes silently stops after long idle — poll as backup.
-    session.pollTimer = setInterval(() => this.readNewLines(sessionId), POLL_FALLBACK_MS)
-
-    this.resetInactivityTimer(sessionId)
     log.info(`Attached to session ${sessionId.slice(0, SESSION_ID_DISPLAY)} at ${filePath}`)
   }
 
@@ -340,19 +392,27 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
-    const result = readNewFileLines(session.filePath, session.fileSize, session.fileTail)
+    let result: ReturnType<typeof readNewFileLines>
+    try { result = readNewFileLines(session.filePath, session.fileSize, session.fileTail) }
+    catch (err) { log.debug('Unable to read rollout:', err); return }
     if (!result) return
+    const live = session.sessionDetected
     session.fileSize = result.newSize
     session.fileTail = result.tail
-    session.lastActivityTime = Date.now()
+    if (live) session.lastActivityTime = Date.now()
 
-    // Re-activate if the session had been marked complete on inactivity —
-    // new content means the user resumed the Codex CLI.
-    if (session.sessionCompleted) {
-      session.sessionCompleted = false
-      this._onSessionLifecycle.fire({ type: 'started', sessionId, label: session.label })
-      log.info(`Session ${sessionId.slice(0, SESSION_ID_DISPLAY)} re-activated after idle`)
+    // Live child activity also keeps its root tab active. A newly attached
+    // child's replay must not reactivate a previously completed root.
+    const root = this.sessions.get(session.rootId)
+    if (root && live) {
+      root.lastActivityTime = session.lastActivityTime
+      if (root.sessionCompleted) {
+        root.sessionCompleted = false
+        this._onSessionLifecycle.fire({ type: 'started', sessionId: root.sessionId, label: root.label })
+      }
+      if (root !== session) this.resetInactivityTimer(root.sessionId)
     }
+    session.sessionCompleted = false
 
     for (const line of result.lines) {
       try { session.parser.processLine(line, session.rolloutState) }
@@ -369,6 +429,10 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
     session.inactivityTimer = setTimeout(() => {
       if (session.sessionCompleted) return
       session.sessionCompleted = true
+      if (session.rootId !== sessionId) {
+        session.parser.completeChild(session.rolloutState, 'Inactive')
+        return
+      }
       this._onEvent.fire({
         time: (Date.now() - session.sessionStartTime) / 1000,
         type: 'agent_complete',
@@ -376,19 +440,16 @@ export class CodexSessionWatcher implements AgentSessionWatcher {
         sessionId,
       })
       this._onSessionLifecycle.fire({ type: 'ended', sessionId, label: session.label })
-    }, INACTIVITY_TIMEOUT_MS)
+    }, Math.max(0, INACTIVITY_TIMEOUT_MS - (Date.now() - session.lastActivityTime)))
   }
 
   dispose(): void {
     if (this.scanInterval) { clearInterval(this.scanInterval) }
-    for (const w of this.dirWatchers.values()) w.close()
-    this.dirWatchers.clear()
     for (const s of this.sessions.values()) {
-      s.fileWatcher?.close()
-      if (s.pollTimer) clearInterval(s.pollTimer)
       if (s.inactivityTimer) clearTimeout(s.inactivityTimer)
     }
     this.sessions.clear()
+    this.metadataByPath.clear()
     this._onEvent.dispose()
     this._onSessionDetected.dispose()
     this._onSessionLifecycle.dispose()

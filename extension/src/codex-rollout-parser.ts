@@ -26,12 +26,11 @@
  *                   only. event_msg.exec_command_end / patch_apply_end are
  *                   parallel signals and are skipped.
  *
- * Subagents: Codex does not currently expose subagent spawning in rollouts.
- * The parser emits a single orchestrator; if Codex adds spawn_agent / wait_agent
- * in future, add mapping here.
+ * Each rollout represents one agent. The watcher supplies the parent from
+ * session metadata for child rollouts and routes their events to the root tab.
  */
 
-import { AgentEvent } from './protocol'
+import { AgentEvent, emitSubagentSpawn } from './protocol'
 import {
   ORCHESTRATOR_NAME, HASH_PREFIX_MAX, MESSAGE_MAX, PREVIEW_MAX, RESULT_MAX,
   SYSTEM_PROMPT_BASE_TOKENS, SYSTEM_CONTENT_PREFIXES,
@@ -77,6 +76,7 @@ export interface CodexRolloutState {
   contextBreakdown: CodexContextBreakdown
   /** Orchestrator agent_spawn emitted flag. */
   spawnEmitted: boolean
+  completed: boolean
   /** Last emitted model id, so we only emit model_detected when it changes. */
   lastEmittedModel: string | null
   /** Authoritative total tokens from the last event_msg.token_count, if any. */
@@ -100,6 +100,7 @@ export function createCodexRolloutState(): CodexRolloutState {
       subagentResults: 0,
     },
     spawnEmitted: false,
+    completed: false,
     lastEmittedModel: null,
     lastReportedTokens: null,
     reportedContextWindow: null,
@@ -260,7 +261,27 @@ function extractPatchFilePath(patch: string): string | undefined {
 // ─── Parser ────────────────────────────────────────────────────────────────
 
 export class CodexRolloutParser {
-  constructor(private delegate: CodexParserDelegate) {}
+  constructor(
+    private readonly delegate: CodexParserDelegate,
+    private readonly agentName = ORCHESTRATOR_NAME,
+    private readonly parentName?: string,
+  ) {}
+
+  completeChild(state: CodexRolloutState, summary: string): void {
+    if (!this.parentName || !state.spawnEmitted || state.completed) return
+    state.completed = true
+    const time = this.delegate.elapsed()
+    this.delegate.emit({
+      time,
+      type: 'agent_complete',
+      payload: { name: this.agentName },
+    })
+    this.delegate.emit({
+      time,
+      type: 'subagent_return',
+      payload: { child: this.agentName, parent: this.parentName, summary },
+    })
+  }
 
   /** Parse a single JSONL line. Silently skips unparseable/unknown lines. */
   processLine(line: string, state: CodexRolloutState): void {
@@ -293,6 +314,10 @@ export class CodexRolloutParser {
   private ensureSpawned(state: CodexRolloutState): void {
     if (state.spawnEmitted) return
     state.spawnEmitted = true
+    if (this.parentName) {
+      emitSubagentSpawn(this.delegate, this.parentName, this.agentName, this.agentName)
+      return
+    }
     this.delegate.emit({
       time: this.delegate.elapsed(),
       type: 'agent_spawn',
@@ -327,7 +352,7 @@ export class CodexRolloutParser {
       this.delegate.emit({
         time: this.delegate.elapsed(),
         type: 'model_detected',
-        payload: { agent: ORCHESTRATOR_NAME, model: payload.model },
+        payload: { agent: this.agentName, model: payload.model },
       })
     }
   }
@@ -383,7 +408,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'message',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         role,
         content: text.slice(0, MESSAGE_MAX),
       },
@@ -408,7 +433,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'tool_call_start',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tool: name,
         toolUseId: callId,
         args: argsSummary,
@@ -437,7 +462,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'tool_call_end',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tool: pending.name,
         toolUseId: callId,
         result: resultSummary,
@@ -467,7 +492,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'tool_call_start',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tool: name,
         toolUseId: callId,
         args: argsSummary,
@@ -490,7 +515,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'tool_call_start',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tool: 'WebSearch',
         args: query,
         preview: `WebSearch: ${query}`.slice(0, PREVIEW_MAX),
@@ -501,7 +526,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'tool_call_end',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tool: 'WebSearch',
         result: payload.status || 'completed',
         tokenCost: 0,
@@ -514,15 +539,26 @@ export class CodexRolloutParser {
   private handleEventMsg(payload: unknown, state: CodexRolloutState): void {
     if (!isRecord(payload)) return
     switch (payload.type) {
+      case 'task_started':
+        if (state.completed) {
+          state.completed = false
+          state.spawnEmitted = false
+          state.lastEmittedModel = null
+          this.ensureSpawned(state)
+        }
+        return
+      case 'task_complete':
+        return this.completeChild(state, 'Completed')
+      case 'turn_aborted':
+        return this.completeChild(state, 'Interrupted')
       case 'agent_reasoning':
         return this.handleAgentReasoning(payload, state)
       case 'token_count':
         return this.handleTokenCount(payload, state)
       // Other event_msg types are either mirrors of response_item content
       // (agent_message, user_message, exec_command_end, patch_apply_end) or
-      // metadata we don't currently surface (task_started, task_complete,
-      // turn_aborted, context_compacted — the latter paired with the
-      // top-level `compacted` record which we handle authoritatively).
+      // metadata such as context_compacted (handled by the top-level
+      // `compacted` record).
     }
   }
 
@@ -575,7 +611,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'message',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         role: 'thinking',
         content: text.slice(0, MESSAGE_MAX),
       },
@@ -626,7 +662,7 @@ export class CodexRolloutParser {
       time: this.delegate.elapsed(),
       type: 'context_update',
       payload: {
-        agent: ORCHESTRATOR_NAME,
+        agent: this.agentName,
         tokens,
         breakdown: { ...bd },
         ...(state.reportedContextWindow ? { tokensMax: state.reportedContextWindow } : {}),

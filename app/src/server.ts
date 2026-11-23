@@ -29,7 +29,7 @@ export async function startServer(options: ServerOptions) {
   })
   await telemetry.init()
 
-  const relay = await createRelay({ workspace, verbose: options.verbose, telemetry })
+  const relay = await createRelay({ workspace, verbose: options.verbose, telemetry, allCodexWorkspaces: true })
 
   const server = http.createServer((req, res) => {
     // Reject DNS-rebinding requests, which reach 127.0.0.1 under a foreign Host.
